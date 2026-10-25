@@ -1,0 +1,30 @@
+#! /bin/sh
+
+STACK_CTL=/usr/bin/motor_stack_ctl
+
+start() {
+	# Start the UI immediately after /run is mounted.  motor_stack_ctl keeps
+	# EtherCAT discovery in its detached worker so early init is not blocked.
+	"$STACK_CTL" autostart
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		exec "$STACK_CTL" stop
+		;;
+	restart)
+		exec "$STACK_CTL" restart
+		;;
+	status)
+		exec "$STACK_CTL" status
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|status}"
+		exit 1
+		;;
+esac
+
+exit $?

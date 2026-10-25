@@ -1,0 +1,64 @@
+#! /bin/sh
+
+STACK_CTL=/usr/bin/motor_stack_ctl
+RUNTIME_DIR=/run/motor-stack
+UI_PID_FILE=$RUNTIME_DIR/motor_demo.pid
+STACK_WORKER_PID_FILE=$RUNTIME_DIR/motor_stack_worker.pid
+DAEMON_PID_FILE=$RUNTIME_DIR/motor_control_daemon.pid
+SOCKET_PATH=$RUNTIME_DIR/motor_control.sock
+
+pid_file_running() {
+	_PID_FILE=$1
+
+	[ -f "$_PID_FILE" ] || return 1
+
+	_PID=$(cat "$_PID_FILE" 2>/dev/null)
+	[ -n "$_PID" ] || return 1
+
+	kill -0 "$_PID" 2>/dev/null
+}
+
+stack_bootstrap_active() {
+	pid_file_running "$UI_PID_FILE" || return 1
+
+	if pid_file_running "$STACK_WORKER_PID_FILE"; then
+		return 0
+	fi
+
+	if pid_file_running "$DAEMON_PID_FILE"; then
+		return 0
+	fi
+
+	[ -S "$SOCKET_PATH" ]
+}
+
+start() {
+	if stack_bootstrap_active; then
+		return 0
+	fi
+
+	set -a
+	export LV_DRIVERS_SET_PLANE=PRIMARY
+	ulimit -n 1024
+	set +a
+	"$STACK_CTL" autostart
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		exec "$STACK_CTL" stop
+		;;
+	restart)
+		exec "$STACK_CTL" restart
+		;;
+	status)
+		exec "$STACK_CTL" status
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|status}"
+		exit 1
+		;;
+esac

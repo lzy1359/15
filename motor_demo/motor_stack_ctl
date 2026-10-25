@@ -1,0 +1,662 @@
+#!/bin/sh
+
+RUNTIME_DIR=/run/motor-stack
+LOG_DIR=/var/log/motor-stack
+
+STACK_LOG=$LOG_DIR/motor_stack.log
+STACK_WORKER_PID_FILE=$RUNTIME_DIR/motor_stack_worker.pid
+
+ETHERCAT_INIT=/etc/init.d/ethercat
+RT_TUNE_INIT=/etc/init.d/S12rt-tune
+ETHERCAT_CLI=ethercat
+ETHERCAT_CTRL_DEV=/dev/EtherCAT0
+PRIMARY_NET_INTERFACE=eth0
+SECONDARY_NET_INTERFACES="eth1"
+
+DAEMON=/usr/bin/motor_control_daemon
+DAEMON_PID_FILE=$RUNTIME_DIR/motor_control_daemon.pid
+DAEMON_LOG=$LOG_DIR/motor_control_daemon.log
+
+UI=/usr/bin/motor_demo
+UI_PID_FILE=$RUNTIME_DIR/motor_demo.pid
+UI_LOG=$LOG_DIR/motor_demo.log
+
+SOCKET_PATH=$RUNTIME_DIR/motor_control.sock
+
+SOCKET_WAIT_RETRY=10
+DAEMON_READY_RETRY=15
+PROCESS_WAIT_RETRY=5
+ETHERCAT_PREPARE_RETRY=20
+NETDEV_APPEAR_RETRY=10
+NETDEV_CARRIER_RETRY=5
+NETDEV_SETTLE_DELAY=0
+NETDEV_REQUIRE_CARRIER=1
+ETHERCAT_PREPARE_SLEEP_US=100000
+
+DAEMON_CPU_LIST=1
+DAEMON_RT_PRIO=0
+UI_CPU_LIST=1
+WORKER_CPU_LIST=0
+
+timestamp() {
+	date '+%F %T'
+}
+
+ensure_runtime_dirs() {
+	mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
+}
+
+log() {
+	ensure_runtime_dirs
+	echo "$(timestamp) motor_stack_ctl: $*" | tee -a "$STACK_LOG"
+}
+
+has_command() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+cpu_list_available() {
+	_CPU=${1%%[-,]*}
+	[ -d "/sys/devices/system/cpu/cpu$_CPU" ]
+}
+
+prepare_process_limits() {
+	ulimit -n 1024 2>/dev/null || true
+	ulimit -l unlimited 2>/dev/null || true
+	ulimit -r 99 2>/dev/null || true
+}
+
+netdev_exists() {
+	_IFACE=$1
+
+	[ -d "/sys/class/net/$_IFACE" ]
+}
+
+bring_netdev_up() {
+	_IFACE=$1
+
+	if ! command -v ip >/dev/null 2>&1; then
+		return 0
+	fi
+
+	ip link set dev "$_IFACE" up >/dev/null 2>&1 || true
+}
+
+sleep_us() {
+	_DELAY_US=$1
+	_SEC=
+	_USEC=
+
+	if command -v usleep >/dev/null 2>&1; then
+		usleep "$_DELAY_US"
+		return 0
+	fi
+
+	_SEC=$((_DELAY_US / 1000000))
+	_USEC=$((_DELAY_US % 1000000))
+	if sleep "${_SEC}.$(printf '%06d' "$_USEC")" 2>/dev/null; then
+		return 0
+	fi
+
+	sleep 1
+}
+
+ethercat_control_device_ready() {
+	[ -c "$ETHERCAT_CTRL_DEV" ]
+}
+
+wait_for_netdev() {
+	_IFACE=$1
+	_REQUIRED=$2
+	_RETRY=0
+
+	while [ $_RETRY -lt $NETDEV_APPEAR_RETRY ]; do
+		if netdev_exists "$_IFACE"; then
+			log "network interface detected: $_IFACE"
+			return 0
+		fi
+		sleep 1
+		_RETRY=$((_RETRY + 1))
+	done
+
+	if [ "$_REQUIRED" = "required" ]; then
+		log "network interface wait timeout: $_IFACE"
+		return 1
+	fi
+
+	log "network interface missing, continue: $_IFACE"
+	return 0
+}
+
+wait_for_carrier() {
+	_IFACE=$1
+	_REQUIRED=$2
+	_RETRY=0
+
+	if ! netdev_exists "$_IFACE"; then
+		if [ "$_REQUIRED" = "required" ]; then
+			log "network interface unavailable: $_IFACE"
+			return 1
+		fi
+		return 0
+	fi
+
+	while [ $_RETRY -lt $NETDEV_CARRIER_RETRY ]; do
+		if [ -r "/sys/class/net/$_IFACE/carrier" ] &&
+		   [ "$(cat "/sys/class/net/$_IFACE/carrier" 2>/dev/null)" = "1" ]; then
+			log "network carrier ready: $_IFACE"
+			return 0
+		fi
+		sleep 1
+		_RETRY=$((_RETRY + 1))
+	done
+
+	if [ "$_REQUIRED" = "required" ]; then
+		log "network carrier wait timeout: $_IFACE"
+		return 1
+	fi
+
+	log "network carrier not ready, continue: $_IFACE"
+	return 0
+}
+
+wait_for_network_ready() {
+	_IFACE=
+
+	log "waiting for network interfaces before EtherCAT start"
+
+	if ! wait_for_netdev "$PRIMARY_NET_INTERFACE" required; then
+		return 1
+	fi
+	bring_netdev_up "$PRIMARY_NET_INTERFACE"
+
+	for _IFACE in $SECONDARY_NET_INTERFACES; do
+		if netdev_exists "$_IFACE"; then
+			bring_netdev_up "$_IFACE"
+			log "secondary interface prepared without carrier wait: $_IFACE"
+		else
+			log "secondary interface not present yet, skip wait: $_IFACE"
+		fi
+	done
+
+	if [ "$NETDEV_REQUIRE_CARRIER" -gt 0 ]; then
+		if ! wait_for_carrier "$PRIMARY_NET_INTERFACE" required; then
+			return 1
+		fi
+	else
+		log "skip network carrier wait for fast EtherCAT start: $PRIMARY_NET_INTERFACE"
+	fi
+
+	if [ "$NETDEV_SETTLE_DELAY" -gt 0 ]; then
+		sleep "$NETDEV_SETTLE_DELAY"
+	fi
+
+	log "network interface preparation complete"
+	return 0
+}
+
+spawn_detached() {
+	_LOG_FILE=$1
+	shift
+
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$@" >> "$_LOG_FILE" 2>&1 </dev/null &
+	else
+		nohup "$@" >> "$_LOG_FILE" 2>&1 </dev/null &
+	fi
+	echo $!
+}
+
+spawn_silent() {
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$@" >/dev/null 2>&1 </dev/null &
+	else
+		nohup "$@" >/dev/null 2>&1 </dev/null &
+	fi
+	echo $!
+}
+
+spawn_cpu_bound_detached() {
+	_LOG_FILE=$1
+	_CPU_LIST=$2
+	shift 2
+
+	if [ -n "$_CPU_LIST" ] && cpu_list_available "$_CPU_LIST" && has_command taskset; then
+		set -- taskset -c "$_CPU_LIST" "$@"
+	fi
+
+	spawn_detached "$_LOG_FILE" "$@"
+}
+
+spawn_cpu_bound_silent() {
+	_CPU_LIST=$1
+	shift
+
+	if [ -n "$_CPU_LIST" ] && cpu_list_available "$_CPU_LIST" && has_command taskset; then
+		set -- taskset -c "$_CPU_LIST" "$@"
+	fi
+
+	spawn_silent "$@"
+}
+
+spawn_rt_detached() {
+	_LOG_FILE=$1
+	_CPU_LIST=$2
+	_RT_PRIO=$3
+	shift 3
+
+	if [ -n "$_CPU_LIST" ] && cpu_list_available "$_CPU_LIST" && has_command taskset; then
+		set -- taskset -c "$_CPU_LIST" "$@"
+	fi
+	if has_command chrt; then
+		set -- chrt -f "$_RT_PRIO" "$@"
+	fi
+	if has_command ionice; then
+		set -- ionice -c 2 -n 0 "$@"
+	fi
+
+	spawn_detached "$_LOG_FILE" "$@"
+}
+
+read_pid_file() {
+	_PID_FILE=$1
+
+	[ -f "$_PID_FILE" ] || return 1
+
+	_PID=$(tr -cd '0-9' < "$_PID_FILE" 2>/dev/null)
+	[ -n "$_PID" ] || return 1
+
+	printf '%s\n' "$_PID"
+}
+
+pid_is_running() {
+	_PID_FILE=$1
+
+	_PID=$(read_pid_file "$_PID_FILE") || {
+		return 1
+	}
+
+	kill -0 "$_PID" 2>/dev/null
+}
+
+cleanup_pid_file() {
+	_PID_FILE=$1
+
+	if ! pid_is_running "$_PID_FILE"; then
+		rm -f "$_PID_FILE"
+	fi
+}
+
+stop_pid_file() {
+	_PID_FILE=$1
+	_NAME=$2
+
+	if ! pid_is_running "$_PID_FILE"; then
+		rm -f "$_PID_FILE"
+		return 0
+	fi
+
+	_PID=$(read_pid_file "$_PID_FILE") || return 0
+	log "stopping $_NAME (pid=$_PID)"
+	kill "$_PID" 2>/dev/null || true
+
+	_RETRY=0
+	while [ $_RETRY -lt $PROCESS_WAIT_RETRY ]; do
+		if ! kill -0 "$_PID" 2>/dev/null; then
+			break
+		fi
+		sleep 1
+		_RETRY=$((_RETRY + 1))
+	done
+
+	if kill -0 "$_PID" 2>/dev/null; then
+		log "$_NAME still running, sending SIGKILL"
+		kill -9 "$_PID" 2>/dev/null || true
+	fi
+
+	rm -f "$_PID_FILE"
+}
+
+cleanup_self_pid_file() {
+	_PID_FILE=$1
+	_SELF=$$
+
+	if [ -f "$_PID_FILE" ] &&
+	   [ "$(read_pid_file "$_PID_FILE" 2>/dev/null)" = "$_SELF" ]; then
+		rm -f "$_PID_FILE"
+	fi
+}
+
+wait_for_daemon_ready() {
+	_PID_FILE=$1
+	_RETRY=0
+
+	while [ $_RETRY -lt $DAEMON_READY_RETRY ]; do
+		if ! pid_is_running "$_PID_FILE"; then
+			log "daemon exited before motor became ready"
+			return 1
+		fi
+
+		if grep -Eq "motor_control_daemon: motor (is ready|recovered)" \
+			"$DAEMON_LOG" 2>/dev/null; then
+			log "daemon motor ready"
+			return 0
+		fi
+
+		sleep 1
+		_RETRY=$((_RETRY + 1))
+	done
+
+	log "daemon motor ready wait timeout"
+	return 1
+}
+
+ensure_daemon_started() {
+	cleanup_pid_file "$DAEMON_PID_FILE"
+
+	if pid_is_running "$DAEMON_PID_FILE"; then
+		if [ -S "$SOCKET_PATH" ]; then
+			log "daemon already running"
+			return 0
+		fi
+
+		log "daemon running without socket, restarting"
+		stop_pid_file "$DAEMON_PID_FILE" "motor_control_daemon"
+	fi
+
+	start_daemon
+}
+
+ensure_daemon_ready() {
+	cleanup_pid_file "$DAEMON_PID_FILE"
+
+	if pid_is_running "$DAEMON_PID_FILE"; then
+		log "daemon already running"
+		if wait_for_daemon_ready "$DAEMON_PID_FILE"; then
+			return 0
+		fi
+
+		log "daemon running but not ready, restarting"
+		stop_pid_file "$DAEMON_PID_FILE" "motor_control_daemon"
+	fi
+
+	if ! start_daemon; then
+		return 1
+	fi
+
+	wait_for_daemon_ready "$DAEMON_PID_FILE"
+}
+
+ensure_ethercat() {
+	if [ ! -x "$ETHERCAT_INIT" ]; then
+		log "missing ethercat init script: $ETHERCAT_INIT"
+		return 1
+	fi
+
+	if ethercat_control_device_ready; then
+		if "$ETHERCAT_INIT" status >/dev/null 2>&1; then
+			log "ethercat master already running"
+			return 0
+		fi
+
+		log "ethercat control device already ready"
+		return 0
+	fi
+
+	log "starting ethercat master"
+	if ! "$ETHERCAT_INIT" start >> "$STACK_LOG" 2>&1; then
+		log "ethercat master start command failed"
+		return 1
+	fi
+
+	_RETRY=0
+	while [ $_RETRY -lt $ETHERCAT_PREPARE_RETRY ]; do
+		if ethercat_control_device_ready; then
+			log "ethercat control device ready, let daemon wait for idle phase"
+			return 0
+		fi
+
+		sleep_us "$ETHERCAT_PREPARE_SLEEP_US"
+		_RETRY=$((_RETRY + 1))
+	done
+
+	log "ethercat control device wait timeout"
+	return 1
+}
+
+refresh_rt_tuning() {
+	if [ ! -x "$RT_TUNE_INIT" ]; then
+		return 0
+	fi
+
+	log "refreshing rt tuning after EtherCAT bring-up"
+	"$RT_TUNE_INIT" restart >> "$STACK_LOG" 2>&1 || true
+}
+
+start_daemon() {
+	cleanup_pid_file "$DAEMON_PID_FILE"
+
+	if pid_is_running "$DAEMON_PID_FILE"; then
+		log "daemon already running"
+		return 0
+	fi
+
+	ensure_runtime_dirs
+	prepare_process_limits
+	rm -f "$SOCKET_PATH"
+	: > "$DAEMON_LOG"
+	echo "$(timestamp) starting $DAEMON" >> "$DAEMON_LOG"
+	_PID=$(spawn_cpu_bound_detached "$DAEMON_LOG" "$DAEMON_CPU_LIST" \
+		env MOTOR_CONTROL_CPU="$DAEMON_CPU_LIST" \
+		MOTOR_CONTROL_RT_PRIO="$DAEMON_RT_PRIO" \
+		"$DAEMON")
+	echo "$_PID" > "$DAEMON_PID_FILE"
+	log "started daemon pid=$_PID"
+
+	_RETRY=0
+	while [ $_RETRY -lt $SOCKET_WAIT_RETRY ]; do
+		if [ -S "$SOCKET_PATH" ] && kill -0 "$_PID" 2>/dev/null; then
+			log "daemon socket ready: $SOCKET_PATH"
+			return 0
+		fi
+		if ! kill -0 "$_PID" 2>/dev/null; then
+			log "daemon exited before socket became ready"
+			return 1
+		fi
+		sleep 1
+		_RETRY=$((_RETRY + 1))
+	done
+
+	log "daemon socket wait timeout"
+	return 1
+}
+
+start_ui() {
+	cleanup_pid_file "$UI_PID_FILE"
+
+	if pid_is_running "$UI_PID_FILE"; then
+		log "ui already running"
+		return 0
+	fi
+
+	ensure_runtime_dirs
+	prepare_process_limits
+	: > "$UI_LOG"
+	echo "$(timestamp) starting $UI" >> "$UI_LOG"
+	_PID=$(spawn_cpu_bound_detached "$UI_LOG" "$UI_CPU_LIST" "$UI")
+	echo "$_PID" > "$UI_PID_FILE"
+	log "started ui pid=$_PID"
+	return 0
+}
+
+start_worker() {
+	cleanup_pid_file "$STACK_WORKER_PID_FILE"
+
+	if pid_is_running "$STACK_WORKER_PID_FILE"; then
+		log "stack worker already running"
+		return 0
+	fi
+
+	ensure_runtime_dirs
+	_PID=$(spawn_cpu_bound_silent "$WORKER_CPU_LIST" "$0" background-start)
+	echo "$_PID" > "$STACK_WORKER_PID_FILE"
+	log "started stack worker pid=$_PID"
+	return 0
+}
+
+stop_apps() {
+	stop_pid_file "$STACK_WORKER_PID_FILE" "motor_stack_worker"
+	stop_pid_file "$UI_PID_FILE" "motor_demo"
+	stop_pid_file "$DAEMON_PID_FILE" "motor_control_daemon"
+	rm -f "$SOCKET_PATH"
+}
+
+stop_ui_only() {
+	stop_pid_file "$UI_PID_FILE" "motor_demo"
+}
+
+prepare_backend() {
+	log "stack backend begin"
+	if ! wait_for_network_ready; then
+		log "network interface prepare failed"
+		stop_pid_file "$DAEMON_PID_FILE" "motor_control_daemon"
+		return 1
+	fi
+	# Start the master as soon as the dedicated link is usable. The daemon can
+	# wait for the scan in parallel, and tuning is most useful after its threads
+	# exist.
+	if ! ensure_ethercat; then
+		log "ethercat prepare failed"
+		stop_pid_file "$DAEMON_PID_FILE" "motor_control_daemon"
+		return 1
+	fi
+	refresh_rt_tuning
+	log "starting daemon after EtherCAT master is available"
+	if ! ensure_daemon_started; then
+		log "daemon start failed"
+		stop_pid_file "$DAEMON_PID_FILE" "motor_control_daemon"
+		return 1
+	fi
+	log "ethercat ready, waiting daemon motor ready"
+	if ! ensure_daemon_ready; then
+		log "daemon ready failed"
+		stop_pid_file "$DAEMON_PID_FILE" "motor_control_daemon"
+		return 1
+	fi
+	log "stack backend ready"
+	return 0
+}
+
+run_worker() {
+	trap 'cleanup_self_pid_file "$STACK_WORKER_PID_FILE"' EXIT INT TERM HUP
+	prepare_process_limits
+
+	if ! prepare_backend; then
+		log "stack worker failed"
+		return 1
+	fi
+
+	log "stack worker complete"
+	return 0
+}
+
+start_stack() {
+	log "stack start begin"
+	prepare_process_limits
+	if ! start_ui; then
+		log "ui start failed"
+		return 1
+	fi
+	if ! start_worker; then
+		log "stack worker start failed"
+		return 1
+	fi
+	log "stack start detached, ui first and backend waits in background"
+	return 0
+}
+
+start_ui_only() {
+	log "ui-only start begin"
+	prepare_process_limits
+	if ! start_ui; then
+		log "ui-only start failed"
+		return 1
+	fi
+	log "ui-only start complete"
+	return 0
+}
+
+restart_stack() {
+	log "stack restart begin"
+	stop_apps
+	if ! start_stack; then
+		log "stack restart failed"
+		return 1
+	fi
+	log "stack restart detached"
+	return 0
+}
+
+show_status() {
+	if [ -x "$ETHERCAT_INIT" ]; then
+		"$ETHERCAT_INIT" status || true
+	fi
+
+	if command -v "$ETHERCAT_CLI" >/dev/null 2>&1; then
+		"$ETHERCAT_CLI" slaves 2>/dev/null || true
+	fi
+
+	if pid_is_running "$STACK_WORKER_PID_FILE"; then
+		echo "motor_stack_worker: running pid=$(read_pid_file "$STACK_WORKER_PID_FILE")"
+	else
+		echo "motor_stack_worker: stopped"
+	fi
+
+	if pid_is_running "$DAEMON_PID_FILE"; then
+		echo "motor_control_daemon: running pid=$(read_pid_file "$DAEMON_PID_FILE")"
+	else
+		echo "motor_control_daemon: stopped"
+	fi
+
+	if pid_is_running "$UI_PID_FILE"; then
+		echo "motor_demo: running pid=$(read_pid_file "$UI_PID_FILE")"
+	else
+		echo "motor_demo: stopped"
+	fi
+
+	if [ -S "$SOCKET_PATH" ]; then
+		echo "socket: $SOCKET_PATH"
+	else
+		echo "socket: missing"
+	fi
+}
+
+case "$1" in
+	start|autostart)
+		start_stack
+		;;
+	ui-start)
+		start_ui_only
+		;;
+	background-start)
+		run_worker
+		;;
+	stop)
+		stop_apps
+		;;
+	ui-stop)
+		stop_ui_only
+		;;
+	restart)
+		restart_stack
+		;;
+	status)
+		show_status
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|status|autostart|ui-start|ui-stop}"
+		exit 1
+		;;
+esac
+
+exit $?
